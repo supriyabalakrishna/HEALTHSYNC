@@ -1,18 +1,41 @@
-import requests
 import os
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 NODEMCU_IP = os.getenv(
     "NODEMCU_IP"
 )
 
+
 def activate_corridor():
 
-    requests.get(
-        f"http://{NODEMCU_IP}/emergency"
-    )
+    try:
+
+        requests.get(
+            f"http://{NODEMCU_IP}/emergency",
+            timeout=3
+        )
+
+        return True
+
+    except:
+
+        return False
+
 
 def normal_mode():
 
-    requests.get(
-        f"http://{NODEMCU_IP}/normal"
-    )
+    try:
+
+        requests.get(
+            f"http://{NODEMCU_IP}/normal",
+            timeout=3
+        )
+
+        return True
+
+    except:
+
+        return False
