@@ -1,5 +1,6 @@
 # app.py
 # Urban Guardian AI - HackArena Edition
+
 from backup_ai import backup_analysis
 import streamlit as st
 import google.generativeai as genai
@@ -226,127 +227,223 @@ if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
 # =========================================================
-# FALLBACK
+# ROUTE OVERRIDE
+# Determines route_id from emergency type keywords.
+# This runs after Gemini parse to fix any incorrect values.
 # =========================================================
 
-def fallback_response():
+def determine_route_id(emergency_type: str) -> str:
+    """
+    Derive the correct route_id from the emergency type string.
+    Always overrides Gemini's route_id to prevent misclassification.
 
+    Route A → Medical / Cardiac / Ambulance
+    Route B → Road Accident / Collision / Vehicle Crash
+    Route C → Fire / Explosion / Building Fire
+    """
+    t = emergency_type.lower()
+
+    # Route C — Fire emergencies (check before generic keywords)
+    if any(k in t for k in ["fire", "explosion", "blast", "inferno", "burning"]):
+        return "C"
+
+    # Route B — Road accident / collision
+    if any(k in t for k in ["accident", "collision", "crash", "vehicular", "highway", "road"]):
+        return "B"
+
+    # Route A — Medical / cardiac / ambulance (default for medical)
+    if any(k in t for k in [
+        "cardiac", "heart", "medical", "ambulance",
+        "stroke", "trauma", "injury", "patient", "emergency"
+    ]):
+        return "A"
+
+    # Default fallback — treat unknown as medical
+    return "A"
+
+# =========================================================
+# FALLBACK
+# Returns a safe static response when all AI fails.
+# =========================================================
+
+def fallback_response() -> dict:
+    """Returns a hardcoded safe fallback response dict."""
     return {
-        "severity":"Critical",
-        "type":"Cardiac Emergency",
-        "location":"Silk Board Junction",
-        "hospital":"Apollo Hospital",
-        "route":[
+        "severity": "Critical",
+        "type": "Cardiac Emergency",
+        "location": "Silk Board Junction",
+        "hospital": "Apollo Hospital",
+        "route": [
             "Silk Board",
             "BTM Layout",
             "Apollo Hospital"
         ],
-        "corridor_required":True,
-        "citizen_alert":
-        "Emergency ambulance approaching. Please use alternate routes."
+        "route_id": "A",
+        "corridor_required": True,
+        "citizen_alert": "Emergency ambulance approaching. Please use alternate routes."
     }
 
 # =========================================================
-# GEMINI ANALYSIS
+# ANALYZE EMERGENCY
+# Primary AI function. Calls Gemini, parses response,
+# overrides route_id, falls back gracefully on any error.
 # =========================================================
 
-def analyze_emergency(text):
+def analyze_emergency(text: str) -> dict:
+    """
+    Analyze an emergency description using Gemini AI.
 
-    if not GEMINI_API_KEY:
-        return fallback_response()
+    Steps:
+    1. Build structured prompt requesting JSON output.
+    2. Call Gemini API.
+    3. Parse JSON response safely.
+    4. Override route_id using local keyword logic.
+    5. Fall back to backup_analysis() or fallback_response() on failure.
+    """
 
     prompt = f"""
-You are Urban Guardian AI.
+    You are Urban Guardian AI.
 
-Analyze the emergency.
+    Analyze the emergency and return ONLY valid JSON.
 
-Return ONLY JSON.
+    ROUTE ASSIGNMENT RULES:
 
-{{
-"severity":"",
-"type":"",
-"location":"",
-"hospital":"",
-"route":[],
-"corridor_required":true,
-"citizen_alert":""
-}}
+    1. Cardiac Emergency
+    2. Ambulance Emergency
+    3. Medical Emergency
+    → route_id = "A"
 
-Emergency:
-{text}
-"""
+    1. Road Accident
+    2. Vehicular Accident
+    3. Collision
+    4. Highway Crash
+    → route_id = "B"
 
-    try:
+    1. Fire Emergency
+    2. Building Fire
+    3. Explosion
+    4. Fire Brigade Response
+    → route_id = "C"
 
-        model = genai.GenerativeModel(
-            "gemini-2.5-flash"
-        )
+    IMPORTANT:
+    - route_id MUST be exactly A, B, or C.
+    - Do not leave route_id empty.
+    - Choose the hospital closest to the emergency.
+    - corridor_required should be true for critical emergencies.
 
-        response = model.generate_content(
-            prompt
-        )
+    Return ONLY JSON in this format:
 
-        clean = (
-            response.text
-            .replace("```json","")
-            .replace("```","")
-            .strip()
-        )
+    {{
+        "severity":"",
+        "type":"",
+        "location":"",
+        "hospital":"",
+        "route":[],
+        "route_id":"",
+        "corridor_required":true,
+        "citizen_alert":""
+    }}
 
-        return json.loads(clean)
+    Emergency Description:
+    {text}
+    """
 
-    except Exception:
-        return fallback_response()
+    # --- Attempt Gemini call ---
+    if GEMINI_API_KEY:
+        try:
+            model = genai.GenerativeModel("gemini-2.5-flash")
+            response = model.generate_content(prompt)
+
+            # Strip markdown fences if present
+            clean = (
+                response.text
+                .replace("```json", "")
+                .replace("```", "")
+                .strip()
+            )
+
+            # Parse JSON safely
+            try:
+                data = json.loads(clean)
+            except json.JSONDecodeError:
+                st.warning("⚠ Gemini returned invalid JSON. Using Backup AI.")
+                data = backup_analysis(text)
+
+        except Exception as e:
+            # Covers quota errors, network issues, API failures
+            err_msg = str(e).lower()
+            if "quota" in err_msg or "rate" in err_msg:
+                st.warning("⚠ Gemini API quota exceeded. Using Backup AI.")
+            else:
+                st.warning("⚠ Gemini unavailable. Using Backup AI.")
+            data = backup_analysis(text)
+    else:
+        # No API key configured — use backup immediately
+        st.warning("⚠ Gemini API key not set. Using Backup AI.")
+        data = backup_analysis(text)
+
+    # --- Safety check: ensure data is a valid dict ---
+    if not isinstance(data, dict):
+        data = fallback_response()
+
+    # --- Ensure all required keys exist ---
+    required_keys = {
+        "severity": "Unknown",
+        "type": "Emergency",
+        "location": "Unknown",
+        "hospital": "Nearest Hospital",
+        "route": [],
+        "route_id": "A",
+        "corridor_required": True,
+        "citizen_alert": "Emergency in progress. Please clear the route."
+    }
+    for key, default in required_keys.items():
+        if key not in data or data[key] is None or data[key] == "":
+            data[key] = default
+
+    # --- Override route_id using local keyword logic ---
+    # This ensures correct corridor activation regardless of AI output.
+    data["route_id"] = determine_route_id(data["type"])
+
+    return data
 
 # =========================================================
 # NODEMCU
 # =========================================================
 
-def activate_corridor():
-
+def activate_route_a():
     try:
-
-        requests.get(
-            f"http://{NODEMCU_IP}/emergency",
-            timeout=2
-        )
-
+        requests.get(f"http://{NODEMCU_IP}/emergencyA", timeout=2)
         return True
-
     except:
-
         return False
 
+def activate_route_b():
+    try:
+        requests.get(f"http://{NODEMCU_IP}/emergencyB", timeout=2)
+        return True
+    except:
+        return False
+
+def activate_route_c():
+    try:
+        requests.get(f"http://{NODEMCU_IP}/emergencyC", timeout=2)
+        return True
+    except:
+        return False
 
 def normal_mode():
-
     try:
-
-        requests.get(
-            f"http://{NODEMCU_IP}/normal",
-            timeout=2
-        )
-
+        requests.get(f"http://{NODEMCU_IP}/normal", timeout=2)
         return True
-
     except:
-
         return False
 
-
 def get_status():
-
     try:
-
-        requests.get(
-            f"http://{NODEMCU_IP}/status",
-            timeout=2
-        )
-
+        requests.get(f"http://{NODEMCU_IP}/status", timeout=2)
         return True
-
     except:
-
         return False
 
 # =========================================================
@@ -399,12 +496,9 @@ with tab1:
         with st.spinner(
             "🤖 AI Agents Coordinating..."
         ):
+            data = analyze_emergency(emergency)
 
-            data = analyze_emergency(
-                emergency
-            )
-
-        c1,c2,c3,c4 = st.columns(4)
+        c1, c2, c3, c4 = st.columns(4)
 
         c1.metric(
             "Severity",
@@ -430,15 +524,11 @@ with tab1:
 
         st.divider()
 
-        left,right = st.columns(
-            [2,1]
-        )
+        left, right = st.columns([2, 1])
 
         with left:
 
-            st.subheader(
-                "🧠 AI Analysis"
-            )
+            st.subheader("🧠 AI Analysis")
 
             st.info(
                 f"Emergency Type: {data['type']}"
@@ -454,57 +544,42 @@ with tab1:
 
         with right:
 
-            st.subheader(
-                "🤖 Agents"
-            )
+            st.subheader("🤖 Agents")
 
-            st.success(
-                "Emergency Agent"
-            )
-
-            st.success(
-                "Hospital Agent"
-            )
-
-            st.success(
-                "Traffic Agent"
-            )
-
-            st.success(
-                "Citizen Alert Agent"
-            )
+            st.success("Emergency Agent")
+            st.success("Hospital Agent")
+            st.success("Traffic Agent")
+            st.success("Citizen Alert Agent")
 
         st.divider()
 
-        st.subheader(
-            "🚦 Traffic Control"
-        )
+        st.subheader("🚦 Traffic Control")
 
         if data["corridor_required"]:
 
-            activate_corridor()
+            route_id = data.get("route_id", "A")
+
+            if route_id == "A":
+                activate_route_a()
+            elif route_id == "B":
+                activate_route_b()
+            elif route_id == "C":
+                activate_route_c()
 
             st.success(
-                "Emergency Corridor Activated"
+                f"Emergency Corridor {route_id} Activated"
             )
 
         else:
 
             normal_mode()
-
-            st.info(
-                "Normal Traffic Mode"
-            )
+            st.info("Normal Traffic Mode")
 
         st.divider()
 
-        st.subheader(
-            "📢 Citizen Alert"
-        )
+        st.subheader("📢 Citizen Alert")
 
-        st.warning(
-            data["citizen_alert"]
-        )
+        st.warning(data["citizen_alert"])
 
 # =========================================================
 # TAB 2
@@ -512,85 +587,91 @@ with tab1:
 
 with tab2:
 
-    st.subheader(
-        "🗺 Smart City Route Visualization"
-    )
+    st.subheader("🗺 Smart City Route Visualization")
 
     m = folium.Map(
-        location=[12.9279,77.6271],
+        location=[12.9279, 77.6271],
         zoom_start=12
     )
 
     folium.Marker(
-        [12.9279,77.6271],
+        [12.9279, 77.6271],
         popup="🚑 Ambulance"
     ).add_to(m)
 
     folium.Marker(
-        [12.8945,77.5970],
+        [12.8945, 77.5970],
         popup="🏥 Apollo Hospital"
     ).add_to(m)
 
     folium.PolyLine(
         [
-            [12.9279,77.6271],
-            [12.8945,77.5970]
+            [12.9279, 77.6271],
+            [12.8945, 77.5970]
         ],
         color="lime",
         weight=8
     ).add_to(m)
 
-    st_folium(
-        m,
-        width=1200,
-        height=500
-    )
+    st_folium(m, width=1200, height=500)
+
 # =========================================================
 # TAB 3
 # =========================================================
 
 with tab3:
 
-    st.subheader(
-        "⚙ Hardware Monitoring"
-    )
+    st.subheader("⚙ Hardware Monitoring")
 
     online = get_status()
 
-    col1,col2,col3 = st.columns(3)
+    col1, col2, col3 = st.columns(3)
 
     with col1:
-
         st.metric(
             "NodeMCU",
             "ONLINE" if online else "OFFLINE"
         )
 
     with col2:
-
-        st.metric(
-            "Traffic Corridor",
-            "READY"
-        )
+        st.metric("Traffic Corridor", "READY")
 
     with col3:
-
-        st.metric(
-            "Emergency Mode",
-            "STANDBY"
-        )
+        st.metric("Emergency Mode", "STANDBY")
 
     if online:
 
-        st.success(
-            "🟢 NodeMCU Connected Successfully"
-        )
+        st.success("🟢 NodeMCU Connected Successfully")
+
+        st.divider()
+
+        st.subheader("🚦 Manual Traffic Control")
+
+        c1, c2, c3, c4 = st.columns(4)
+
+        with c1:
+            if st.button("🚦 Route A"):
+                activate_route_a()
+                st.success("🚦 Route A Activated")
+
+        with c2:
+            if st.button("🚦 Route B"):
+                activate_route_b()
+                st.success("🚦 Route B Activated")
+
+        with c3:
+            if st.button("🚦 Route C"):
+                activate_route_c()
+                st.success("🚦 Route C Activated")
+
+        with c4:
+            if st.button("🔄 Normal"):
+                normal_mode()
+                st.info("🔄 Normal Mode Activated")
 
     else:
 
-        st.warning(
-            "🟡 NodeMCU Not Reachable"
-        )
+        st.warning("🟡 NodeMCU Not Reachable")
 
 # =========================================================
 # FOOTER
@@ -601,26 +682,12 @@ st.divider()
 st.caption(
     "Powered by Gemini • Agentic AI • ESP8266 • Urban Guardian AI"
 )
+
 st.subheader("📊 Impact Metrics")
 
-c1,c2,c3,c4 = st.columns(4)
+c1, c2, c3, c4 = st.columns(4)
 
-c1.metric(
-    "Response Time Saved",
-    "6 min"
-)
-
-c2.metric(
-    "Traffic Delay Reduced",
-    "32%"
-)
-
-c3.metric(
-    "Emergency Priority",
-    "HIGH"
-)
-
-c4.metric(
-    "Corridor Length",
-    "4.2 km"
-)
+c1.metric("Response Time Saved", "6 min")
+c2.metric("Traffic Delay Reduced", "32%")
+c3.metric("Emergency Priority", "HIGH")
+c4.metric("Corridor Length", "4.2 km")
